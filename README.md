@@ -1,72 +1,121 @@
-# MuShiBot ESP32 固件源码
+[English](README.md) | [简体中文](README.zh-CN.md)
 
-这是独立、可阅读的固件源码副本，保留当前工作树控制逻辑及 u2594 Actor；不含真实网络凭据、训练 checkpoint、编译器、二进制或旧 Git 历史。中文注释说明状态所有权和控制边界，第三方库及生成模型参数保持原字节。
+# MuShiBot ESP32 Firmware
 
-**状态**：当前模型元数据仍有 `hardware_deployment_prohibited: true`。编译/离线回归不等于实机稳定性、安全性或模型部署验收；不要用编译测试产物直接烧录。启动 `initFOC()` 会驱动轮对齐，“上电停止”不等于初始化期间完全无动作。
+Firmware source for a micro wheeled-leg robot: native standing control, an on-device neural Actor, a browser control panel, and telemetry. This README is an engineering entry point for people and coding agents: start with the facts and reading order below, then follow the source paths before changing behavior.
 
-## 目录
+**Hardware deployment is prohibited for the bundled candidate model:** `hardware_deployment_prohibited: true` remains in [model/active-model.json](model/active-model.json). Compilation, offline tests, and identity checks are not hardware safety or stability approval. Do not flash build-only binaries. Startup `initFOC()` can move the wheels for alignment even when the application starts stopped.
 
-- `src/app`：启动、主循环、模式切换与唯一执行顺序。
-- `src/control/native`：零摇杆原生站立；`ai`：Actor适配、历史及动作推进。
-- `src/hardware`：引脚、IMU、电池、轮电机与舵机唯一所有者。
-- `src/network`：网页、NVS网络配置、HTTP和TCP；`telemetry`：固定容量跨核桥。
-- `model`：生成参数和身份合同，参数不要手工排版或修改。
-- `protocol`、`tools`：帧定义、离线解析及构建；`tests`：不接硬件的回归。
-- `lib`、`licenses`：带本地补丁的供应源码和许可；见 THIRD_PARTY.md。
+## 1. Quick facts and scope
 
-## 快速开始：仅编译
+| Item | Contract |
+|---|---|
+| Target | ESP32, Arduino, PlatformIO environment `esp32dev`; this board setting does not identify the physical module or flash capacity |
+| Build versions | PlatformIO Core 6.1.18; espressif32 6.10.0; Arduino package 3.20017.241212+sha.dcc1105b; Xtensa 8.4.0+2021r2-patch5 |
+| Native controller | Zero-joystick standing with PID/filter state; not a runtime joystick, jump, or arbitrary-height interface |
+| AI controller | Local u2594 Actor, `63 → 64 → 64 → 4`, tanh; no cloud service, LLM, or firmware Critic |
+| Inputs and outputs | 21 values × 3 history frames; outputs: left leg position, right leg position, left wheel voltage, right wheel voltage |
+| Networking | HTTP 80 for page/status/control; TCP 9871 for a single telemetry client; trusted LAN only |
+| Included | Firmware, generated Actor/contract, patched vendored libraries, build tools, offline tests, and component licenses |
+| Not included | Real network credentials, device NVS, training checkpoints, compilers, binaries, caches, and old Git history |
 
-安装 Python 3 和 PlatformIO Core（固定版本在 requirements-build.txt）：
+## 2. Read in this order
+
+1. This README: scope, safety boundaries, build modes, and runtime semantics.
+2. [SETUP.md](SETUP.md) and [docs/CONFIGURATION.md](docs/CONFIGURATION.md): setup context, pin assignments, units, limits, network configuration, and timing.
+3. [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md), then [src/app/main.cpp](src/app/main.cpp): state ownership and the actual step 1–9 execution order.
+4. The module you intend to change, using the map below. Trace callers and the final hardware submission first.
+5. [model/active-model.json](model/active-model.json) and [deployment/direct_contract.py](deployment/direct_contract.py) before touching any AI adapter or action semantics.
+6. [THIRD_PARTY.md](THIRD_PARTY.md), [dependencies.lock.json](dependencies.lock.json), and [lib/PATCHES.md](lib/PATCHES.md) before touching dependencies. [docs/INDEX.md](docs/INDEX.md) indexes the existing documents, which are currently Chinese.
+
+## 3. Engineering map and data flow
+
+| Path | Responsibility and boundary |
+|---|---|
+| [src/app/main.cpp](src/app/main.cpp) | Startup, mode state, and sole control-loop execution order; the control core owns controller state |
+| [src/control/native/](src/control/native/) | Native standing PID/filter state; resume re-anchors time/distance while retaining state, not a claim of bumpless transfer |
+| [src/control/ai/](src/control/ai/) | Coordinate adaptation, three-frame history, inference, and action progression; `FourCore.h` has no hardware access |
+| [src/control/Safety.h](src/control/Safety.h) | Shared validation, hard-fault conditions, and output limits |
+| [src/hardware/](src/hardware/) | Sole owners of IMU, battery, wheel motors, and servos; `sample()` reads, `apply()` submits |
+| [src/telemetry/Bridge.h](src/telemetry/Bridge.h) | Fixed-capacity cross-core snapshots, commands, status, and events; control never waits for networking |
+| [src/network/Network.cpp](src/network/Network.cpp) / [Page.h](src/network/Page.h) | Core 0 owns Wi-Fi/NVS/HTTP/TCP; the page has independent heartbeat and status polling |
+| [protocol/fields.def](protocol/fields.def) / [Frame.h](protocol/Frame.h) | Shared C++/Python wire layout: 516 bytes per frame |
+| [model/](model/) / [deployment/](deployment/) | Generated parameters, model identity, and deployment contract checks; checkpoints are not compilation dependencies |
+| [tools/](tools/) / [tests/](tests/) | Build, identity checks, offline decoding, and hardware-free regressions |
+| [lib/](lib/) / [licenses/](licenses/) | Vendored patched libraries and retained licenses; do not replace with unpatched upstream versions |
+
+Control flow: hardware sample → finite-input/stop checks → native or AI controller → candidate-output protection and limiting → the unique `hardware::apply()` submission. Preserve the exact order in `main.cpp`; do not write motors from other modules. In AI, observation → previous-action progression → inference completion → new-action acceptance is ordered and must not be rearranged.
+
+Network flow: browser commands → bounded bridge → control core; frozen control snapshots → bounded bridge → HTTP status/TCP logs. Networking consumes copies, never runs control calculations, and cannot mutate frozen frames.
+
+## 4. Quick start: compilation only
+
+Clone using the standard HTTPS URL, then run commands from the project root:
 
 ```sh
+git clone https://github.com/dycsrl/Micro-Wheeled_leg-Robot-AI-Firmware.git
+cd Micro-Wheeled_leg-Robot-AI-Firmware
 python -m pip install -r requirements-build.txt
-python tools/check_source.py
 python tools/build.py --build-only
 ```
 
-所有命令在项目根执行；脚本按自身位置定位，外部目录调用时写完整脚本路径。可通过 `--pio "PlatformIO可执行文件路径"` 指定已有工具，不需要修改全局PATH。平台、Arduino包和Xtensa工具链已固定在 platformio.ini；首次构建需下载这些工具。
+Python 3 and PlatformIO Core are required; the pinned Core version is in [requirements-build.txt](requirements-build.txt). The first build downloads the pinned platform/framework/toolchain. Use `python tools/build.py --pio "<PlatformIO executable>" --build-only` for an existing installation. The wrapper locates the project relative to itself, so it can also be invoked by absolute script path from another directory.
 
-`--build-only` 在生成目录创建**合成网络配置**，没有读取或复制用户密码；只验证编译链接。它拒绝 upload/uploadfs/program，不额外限制正常本地网络配置。日志默认 `build/build.log`，输出在 `.pio/build/esp32dev/`；这些都不是公开源码，也不应提交。可用 `--log 外部日志路径` 改日志位置。
+`--build-only` generates **synthetic network configuration** without reading or copying local passwords. The build hook rejects `upload`, `uploadfs`, and `program` in this mode. The wrapper itself only builds. Default log: `build/build.log`; output: `.pio/build/esp32dev/`. `--log <path>` changes the log destination. Generated output is not source and must not be committed or flashed.
 
-## 普通本地构建与配置
+**Source-check caveat:** `python tools/check_source.py` checks the Actor contract, vendored hashes, and Python syntax, but currently also asserts that the project root has no `.git`. Run it only in an exported source directory without Git metadata (for example, an extracted GitHub source archive). It fails in a normal clone even when those checks pass; do not delete `.git` or bypass the assertion to hide this limitation. No code fix is included in this README-only change.
 
-1. 复制 `include/secrets.example.h` 为同目录 `secrets.h`。
-2. 仅在本机编辑四个宏，删除模板 `#error`。空STA表示不启用默认STA；AP开放或加密配置应按ESP32 Wi-Fi规则和自身风险选择，源码不附加密码静态断言。
-3. 执行 `python tools/build.py`。缺少本地文件会明确失败，不自动使用测试配置。
-4. 不提交 secrets.h、构建产物或设备NVS。普通构建产物可能嵌入凭据。
+## 5. Ordinary local build and secrets
 
-完整硬件、控制、网络和时序参数见 [配置参考](docs/CONFIGURATION.md)。项目没有预置真实设备SSID、IP或用户名。已有设备 `wifi_cfg` NVS可能覆盖STA默认宏；本副本不读取、不迁移设备NVS。
+1. Copy [include/secrets.example.h](include/secrets.example.h) to `include/secrets.h` on your own machine.
+2. Fill `STA_SSID`, `STA_PASS`, `AP_SSID`, and `AP_PSW`, then remove the template `#error`. An empty default STA SSID disables default STA startup. Choose open/encrypted AP configuration according to ESP32 Wi-Fi rules and your risk assessment; the source adds no password-length assertion.
+3. Run `python tools/build.py`. Missing local secrets fail explicitly; ordinary builds do not silently fall back to synthetic configuration.
+4. Keep `include/secrets.h`, device NVS, logs, and build output out of Git. Ordinary binaries can embed credentials; never send passwords in chat.
 
-## 手动烧录/串口说明（本次未执行）
+Existing `wifi_cfg` NVS can override compiled STA defaults. This source copy does not read or migrate a device's NVS during setup. The current page has no network-settings save endpoint; do not invent one. See [configuration](docs/CONFIGURATION.md) for precedence and static-address fallback.
 
-本仓保留候选模型的禁止硬件部署标记，不能仅改JSON将其“批准”。完成模型、接线、电压、方向及机械保护的独立实机审查后，操作者可在**自行配置的普通构建环境**手动运行标准PlatformIO命令：
+Manual upload is **not** a quick-start step. Only after separate model, wiring, supply-voltage, direction, and mechanical-protection review may an operator use a self-configured ordinary build environment:
 
 ```sh
-pio run -e esp32dev -t upload --upload-port <本机端口>
-pio device monitor --port <本机端口> --baud 115200
+pio run -e esp32dev -t upload --upload-port <port>
+pio device monitor --port <port> --baud 115200
 ```
 
-不要对合成配置运行上传；本次只构建与离线测试，没有执行上述命令、连接串口或操作机器人。
+Do not upload synthetic configurations. Changing a JSON prohibition flag is not deployment approval. No flashing, serial connection, or robot operation is performed by this documentation update.
 
-## 网络连接与操作
+## 6. Runtime modes and safety boundaries
 
-使用本地配置的热点或STA网络连接，HTTP端口80。在串口启动诊断中确认分配地址，然后浏览器访问该地址（不要猜固定IP）。AP+STA同时启用；保存配置优先、失败重连的行为见配置文档。
+Connect through your locally configured AP or STA network; both operate in AP+STA mode. Read the assigned address from serial startup diagnostics rather than assuming a fixed IP, then open it over HTTP port 80. There is no HTTPS, user management, or public-network hardening; the control lease is not TLS authentication. Do not expose the service to the Internet.
 
-上电应用模式为停止，舵机动力意图关闭；初始化轮FOC仍可能动作。网页先“取得控制会话”，再手动选择原生站立；AI只在原生至少500ms且接管条件通过时接纳。状态可读不代表控制权限；命令202只代表入队，必须查看新鲜的实际模式。
+- Startup application mode is stopped with servo-power intent off; FOC initialization can still move wheels.
+- Claim a control session before commanding a mode. Readable status does not prove ownership. HTTP 202 means queued, not completed: inspect fresh actual mode/status.
+- Native standing is a cold entry. AI takeover requires at least 500ms in native, `abs(pitch-nativePitchZero) < 20deg`, valid input, and successful seeding; otherwise `NotStanding` is reported.
+- Return-to-native preserves native state and re-anchors it. Stop/retract stops wheels but retains leg-power intent. Servo-disable stops wheels and releases leg power.
+- **Closing the page does not guarantee stopping.** A 1500ms heartbeat lease expiry returns running AI to native when hard checks pass; already-native control can remain native. Hard faults and manual stops are not automatically cleared by disconnection.
+- Hard checks cover finite values, `accZ > 1.8g`, valid battery, `abs(pitch) > 25deg` or `abs(roll) > 35deg`, and `elapsed > 100000us`. Hard faults stop; a control deadline/Actor failure or lost heartbeat falls back to native only in a running state with hard checks passed.
 
-按钮含义：原生站立=冷入原生；AI=尝试接管；回原生=保留原生状态回切；停止/收腿=停轮且保持腿动力意图；舵机失能=停轮并解除腿动力。**关闭网页不保证停止**：1500ms心跳失联会让运行中的AI交回原生；已在原生则仍可保持原生。硬故障与人工停止不会因失联而自动解除。操作时使用独立机械保护。
+HTTP routes: `GET /`, `/status`, `/diagnostics`; `POST /claim`, `/heartbeat`, `/command` (token and code). Codes: `0` stop, `1` native, `2` AI, `3` return native, `4` servo-disable. Commands expire after 500ms; stop latch has priority. HTTP 403 means unauthorized; 409 means an active owner/conflict. Reclaim deliberately rather than automatically fighting another operator. Use independent mechanical protection.
 
-## 日志和离线测试
+## 7. AI contract and change constraints
 
-TCP 9871只发送日志，支持单客户端；首行JSON身份，后接516字节帧。固定8帧队列满时丢帧计数增长，不等待网络；不承诺无损。采集端须自行完整保存TCP字节流，不要把HTTP状态当全量日志。离线解析：
+- u2594 uses 63 Actor inputs (21 × 3 frames), not the training-side 65-dimensional Critic observation. Input order/scales live in `actor_frame_names` / `actor_scales` in [the model contract](model/active-model.json); `critic_privileged` is empty, not evidence of extra firmware channels.
+- Clip each action to ±1. Output order is left leg, right leg, left wheel, right wheel. Leg desired angle is `clip(-.3297 + .12*a, -.5, -.12)` **rad**. Wheel command is `7.4*a` **V**, held until the next accepted action, with no wheel LPF/P loop. Hardware output protection still applies.
+- Each 1ms leg step limits target change to `.003rad`; estimate moves by `.025*(desired-estimate)`. This is a target-history estimate, **not measured servo feedback**. The adapter converts angles/rates to rad/rad/s and negates both wheels' angle, speed, and voltage; it does not subtract dynamic native pitch zero or swap wheels.
+- Contract control step: **10ms**; simulation step: **1ms**; training action delay: **7ms**. These are not firmware sleeps. Firmware inference is synchronous: do not add a synthetic 7ms delay. Progression uses actual microsecond deltas; gaps over 100ms fail. The AI loop does not promise a forced 10ms wall-clock period. Non-AI `vTaskDelay(1)` plus a minimum 1500us wait is not a fixed 1ms control loop.
+- Keep `model/Actor.h` byte-for-byte consistent with `actor_sha256`. Do not hand-format generated parameters, independently swap weights, reorder observations, alter units, or remove identity/protection checks. Model replacement requires matching export identity, contract, axes, history, timing, and offline forward equivalence, followed by separate hardware review.
+- The checkpoint path in metadata is a source identifier, not a bundled runtime dependency. Identity checks do not verify the complete frozen training provenance. Hardware axes, zero offsets, and loaded servo behavior remain uncalibrated; retain `hardware_deployment_prohibited: true`.
+
+## 8. Telemetry and offline regression
+
+TCP 9871 sends logs only: one JSON identity line followed by 516-byte frames, single client, no authentication/encryption. Save the complete raw byte stream at the receiver. The 8-frame queue drops on overflow rather than waiting for networking; drops and sequence gaps mean logging is not lossless. A client with no send progress for 1500ms is disconnected. HTTP status is not the full log.
 
 ```sh
 python tools/parse.py capture.raw --output frames.jsonl
 ```
 
-输出必须不存在，避免覆盖；摘要含身份、尾部半帧、序列缺口和原生/AI分组统计。遥测字段区分命令、估计与实测。
+The output path must not already exist. The summary reports identity, trailing partial frames, sequence gaps, and native/AI statistics. Distinguish commanded voltage, estimated leg angles, and measured sensors; they are not interchangeable.
 
-主机需 C++11 编译器 `c++` 和 Node.js，Python仅用标准库：
+Host tests require Python 3 (standard library), a C++11 compiler available as `c++`, and Node.js. The scripts invoke `c++` directly; an installed Windows firmware toolchain alone does not satisfy this host-test prerequisite.
 
 ```sh
 python tests/run_host.py
@@ -78,18 +127,26 @@ python tests/test_telemetry_header.py
 node tests/review_page.js
 ```
 
-覆盖真实C++控制/Actor前向、C++帧跨语言解析、主循环硬件桩、推理边界与网页沙箱。不访问硬件。Windows固件编译与macOS离线回归分别验收，不能混称Windows已运行主机C++测试。
+These cover the C++ control/Actor forward path, C++/Python wire decoding, hardware-stubbed main loop, inference boundaries, and browser sandbox. They do not access hardware.
 
-## 排错
+## 9. Verification status and troubleshooting
 
-- 缺 secrets.h：本地配置后普通构建，或仅编译用 --build-only；不要把密码发到聊天。
-- 供应库/Actor指纹失败：恢复锁定字节，核对 dependencies.lock.json 和模型合同，不删除校验。
-- 网页403/409：控制会话过期或其他会话活跃；重新取得权限，不自动争抢。
-- 状态过期/模式未知：检查网络和独立心跳提示，不能假定机器人已停。
-- 不能进AI：先查实际原生持续时间、姿态和reason；未标定模型不能凭按钮成功认定可用。
-- 启动失败：串口 `[BOOT]` 分阶段输出桥、I2C/IMU/FOC/网络；`/diagnostics` 只保留32个事件及首个硬故障，不是无限历史。
-- TCP断开或缺帧：慢客户端1500ms无进展会断开；检查drops和序列，原始日志可能有尾部半帧。
+Prior project verification distinguishes **Windows firmware compilation** from **macOS offline regressions**; it does not claim Windows host C++ tests or hardware deployment passed. This README-only update does not rerun firmware compilation or change code, model bytes, safety logic, or dependencies. Hardware stability/safety, loaded calibration, flashing, and end-to-end robot operation remain unverified here.
 
-## 模型替换与来源
+| Symptom | Check first |
+|---|---|
+| Missing secrets | Configure locally for ordinary builds, or use `--build-only` only for compilation |
+| Source check fails on `.git` | Use an exported source directory as described in section 4; preserve repository metadata |
+| Vendor/Actor fingerprint mismatch | Restore locked bytes; inspect `dependencies.lock.json` and the model contract, never remove checks |
+| Stale status / unknown mode | Check network and independent heartbeat; never assume the robot stopped |
+| AI entry refused | Inspect actual native duration, posture, and reason; button acceptance is not model validation |
+| Startup failure | Read staged `[BOOT]` diagnostics; `/diagnostics` retains only 32 events and the first hard fault, not unlimited history |
+| TCP gaps/disconnect | Inspect drops, sequence numbers, slow-client timeout, and trailing partial frames |
 
-Actor为63→64→64→4 tanh生成网络。不能单独更换参数、观测顺序或合同哈希；需配套导出身份、动作单位、轴向、历史、时序及离线前向一致性验证，另行实机验收。本源码不含checkpoint，身份校验不冒称验证训练冻结来源。见 [架构](docs/ARCHITECTURE.md)、[第三方声明](THIRD_PARTY.md)。各组件沿用原许可，不给全工程统一套MIT，也不新增重新申请授权门槛。
+## 10. Origins and licensing
+
+- Original robot hardware/control: [MuShibo/Micro-Wheeled_leg-Robot](https://github.com/MuShibo/Micro-Wheeled_leg-Robot), contributors **穆世博 (Mu Shibo / MuShibo)** and **李育锋 (Li Yufeng)**. Prior source review found no independent LICENSE; public readability does not imply an MIT license for the whole project. Retain original notices and terms.
+- Deployment-interface reference: [星际浪子 / mujoco_esp32_robot_deploy_public](https://gitee.com/starimpact_admin/mujoco_esp32_robot_deploy_public), MIT, Copyright (c) 2024 星际浪子; retained text in [licenses/](licenses/).
+- Vendored Simple FOC 2.2.1, MPU6050_tockn 1.5.2, and SCServo/SCSservo 1.0.1 retain their source notices, patches, and applicable licenses. SCServo includes a GPL-3.0 reference license; do not relabel it MIT.
+
+Read [THIRD_PARTY.md](THIRD_PARTY.md) for exact provenance, component-license facts, and redistribution obligations, and [lib/PATCHES.md](lib/PATCHES.md) for local patches. There is **no blanket MIT relicensing** and no newly imposed project-wide reauthorization requirement. Training/mechanical assets not included here are not licensed by this README.
