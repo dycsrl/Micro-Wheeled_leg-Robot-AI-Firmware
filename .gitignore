@@ -1,0 +1,13 @@
+/.pio/
+/include/secrets.h
+/build/
+/artifacts/
+__pycache__/
+*.pyc
+*.bin
+*.elf
+*.map
+*.zip
+*.pt
+*.pth
+/deployment/assets/
